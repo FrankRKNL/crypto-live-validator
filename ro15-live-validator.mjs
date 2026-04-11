@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * RO15 Live Shadow-Mode Validator — Production Build v2
+ * RO15 Live Shadow-Mode Validator — Production Build v3
  * 
- * Strategy (exact research spec — DO NOT CHANGE):
+ * Strategy (exact research spec):
  * - Always IN position at start
  * - Exit: price < peak × 0.85 (15% trailing stop)
  * - Re-entry: price > 10-trading-day high
@@ -24,6 +24,7 @@
  *       ├── state.json                   ← global restart state
  *       ├── validator-YYYY-MM-DD.log    ← per-day console log
  *       ├── VALIDATION-TRACKER.md        ← trade log + monitoring
+ *       ├── signals.csv                  ← structured signal log
  *       ├── daily/
  *       │   └── summary-YYYY-MM-DD.csv   ← daily equity snapshots
  *       ├── assets/
@@ -32,11 +33,6 @@
  *       └── alerts/
  *           ├── BTC-alerts.log            ← BTC entry/exit events
  *           └── ETH-alerts.log            ← ETH entry/exit events
- * 
- * State recovery (restart-safe):
- *   On restart, loadAssetState() restores inPosition/entryPrice/peakPrice/
- *   trades/realizedPnL from logs/assets/{ASSET}-state.json.
- *   tenDayPrices and tenDayHigh also persisted — re-entry continuous.
  */
 
 import https from 'https';
@@ -50,18 +46,22 @@ const STATE_PATH      = path.join(LOG_DIR, 'state.json');
 const DAILY_DIR       = path.join(LOG_DIR, 'daily');
 const ALERTS_DIR      = path.join(LOG_DIR, 'alerts');
 const ASSET_LOG_DIR   = path.join(LOG_DIR, 'assets');
+const SIGNAL_LOG      = path.join(LOG_DIR, 'signals.csv');
 
 const CONFIG = {
   assets: ['BTC', 'ETH'],
   trailPct:        0.15,
   reentryLookback: 10,
-  feePct:          0.15,
+  feePct:          0.15,        // 0.15% per trade (Binance realistic)
   slippagePct:     0,
-  pollIntervalMs:  60 * 60 * 1000,
-  lookbackDays:    30,
-  initialCapital:  10000,
+  pollIntervalMs:  60 * 60 * 1000, // 1 hour between polls
+  lookbackDays:    30,            // Fetch 30 days of 1h candles
+  initialCapital:  10000,        // EUR per asset
   apiRetries:      3,
   apiRetryDelayMs: 5000,
+  // Rolling logs
+  logRetentionDays: 14,          // Delete logs older than this
+  signalLogMaxLines: 500,        // Rotate signal log if too long
 };
 
 for (const d of [LOG_DIR, DAILY_DIR, ALERTS_DIR, ASSET_LOG_DIR]) {
@@ -81,9 +81,32 @@ function log(msg, level = 'INFO') {
 }
 
 function logAlert(asset, event, details) {
-  const line = `[${new Date().toISOString()}] [ALERT] ${asset}: ${event} — ${details}`;
+  const ts    = new Date().toISOString();
+  const line  = `[${ts}] [ALERT] ${asset}: ${event} — ${details}`;
   console.log(`  ${line}`);
-  fs.appendFileSync(path.join(ALERTS_DIR, `${asset}-alerts.log`), line + '\n');
+  const alertFile = path.join(ALERTS_DIR, `${asset}-alerts.log`);
+  fs.appendFileSync(alertFile, line + '\n');
+}
+
+function logSignal(asset, signal) {
+  // Structured: timestamp,asset,action,price,candleDate,returnPct,reason,equityEUR,realizedPct,trades
+  const row = [
+    new Date().toISOString(),
+    asset,
+    signal.action,
+    signal.price.toFixed(4),
+    signal.date,
+    signal.return !== null ? (signal.return * 100).toFixed(4) : '',
+    signal.reason,
+    '', // equityEUR — filled by caller
+    '', // realizedPct — filled by caller
+    '', // trades — filled by caller
+  ].join(',');
+  const header = 'timestamp,asset,action,price,candleDate,returnPct,reason,equityEUR,realizedPct,trades';
+  if (!fs.existsSync(SIGNAL_LOG)) {
+    fs.writeFileSync(SIGNAL_LOG, header + '\n');
+  }
+  fs.appendFileSync(SIGNAL_LOG, row + '\n');
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -148,8 +171,11 @@ async function fetchDailyCandles(symbol, days = 30) {
       dailyMap.set(dayKey, { date: new Date(dayKey * 1000).toISOString().slice(0,10), open, high, low, close, volume, trades: 1 });
     } else {
       const e = dailyMap.get(dayKey);
-      e.high = Math.max(e.high, high); e.low = Math.min(e.low, low);
-      e.close = close; e.volume += volume; e.trades++;
+      e.high   = Math.max(e.high, high);
+      e.low    = Math.min(e.low, low);
+      e.close  = close;
+      e.volume += volume;
+      e.trades++;
     }
   }
 
@@ -163,8 +189,10 @@ async function fetchDailyCandles(symbol, days = 30) {
 // ─────────────────────────────────────────────────────────────
 
 function loadState() {
-  try { return fs.existsSync(STATE_PATH) ? JSON.parse(fs.readFileSync(STATE_PATH, 'utf8')) : null; }
-  catch (e) { log(`State load error: ${e.message}`, 'WARN'); return null; }
+  try {
+    if (fs.existsSync(STATE_PATH)) return JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+  } catch (e) { log(`State load error: ${e.message}`, 'WARN'); }
+  return null;
 }
 
 function saveState(state) {
@@ -177,14 +205,13 @@ function saveState(state) {
 
 function loadAssetState(asset) {
   const p = path.join(ASSET_LOG_DIR, `${asset}-state.json`);
-  try { return fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : null; }
-  catch (e) { return null; }
+  try { if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf8')); } catch(e) {}
+  return null;
 }
 
 function saveAssetState(asset, state) {
   const p = path.join(ASSET_LOG_DIR, `${asset}-state.json`);
-  try { fs.writeFileSync(p, JSON.stringify(state, null, 2)); }
-  catch (e) { log(`Asset state save error (${asset}): ${e.message}`, 'ERROR'); }
+  try { fs.writeFileSync(p, JSON.stringify(state, null, 2)); } catch (e) { log(`Asset state save error (${asset}): ${e.message}`, 'ERROR'); }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -197,9 +224,9 @@ class RO15Strategy {
     this.trailPct        = CONFIG.trailPct;
     this.reentryLookback = CONFIG.reentryLookback;
     this.feePct          = CONFIG.feePct;
-    this.slippagePct     = CONFIG.slippagePct;
     this.initialCapital  = CONFIG.initialCapital;
-
+    
+    // Trading state
     this.inPosition    = false;
     this.entryPrice    = 0;
     this.peakPrice     = 0;
@@ -207,29 +234,34 @@ class RO15Strategy {
     this.realizedPnL   = 0;
     this.cumFees       = 0;
     this.lastEvent     = 'INIT';
+    
+    // Current market price for equity tracking
     this.currentPrice  = 0;
+    
+    // Re-entry tracking
     this.tenDayHigh    = 0;
     this.tenDayPrices  = [];
     this.daysSinceExit = 0;
-
+    
+    // Alert deduplication
     this._lastAlertEvent = null;
     this._alertSilence   = 0;
   }
-
-  hydrate(s) {
-    this.inPosition    = s?.inPosition    ?? false;
-    this.entryPrice   = s?.entryPrice    ?? 0;
-    this.peakPrice    = s?.peakPrice     ?? 0;
-    this.trades        = s?.trades        ?? 0;
-    this.realizedPnL  = s?.realizedPnL  ?? 0;
-    this.cumFees      = s?.cumFees       ?? 0;
-    this.lastEvent    = s?.lastEvent     ?? 'INIT';
-    this.tenDayHigh   = s?.tenDayHigh    ?? 0;
-    this.tenDayPrices = Array.isArray(s?.tenDayPrices) ? s.tenDayPrices.slice(-this.reentryLookback) : [];
-    this.daysSinceExit = s?.daysSinceExit ?? 0;
-    this.currentPrice = s?.currentPrice  ?? 0;
+  
+  hydrate(state) {
+    this.inPosition    = state.inPosition    ?? false;
+    this.entryPrice   = state.entryPrice    ?? 0;
+    this.peakPrice    = state.peakPrice     ?? 0;
+    this.trades        = state.trades        ?? 0;
+    this.realizedPnL  = state.realizedPnL  ?? 0;
+    this.cumFees      = state.cumFees       ?? 0;
+    this.lastEvent    = state.lastEvent     ?? 'INIT';
+    this.tenDayHigh   = state.tenDayHigh    ?? 0;
+    this.tenDayPrices = state.tenDayPrices  ?? [];
+    this.daysSinceExit = state.daysSinceExit ?? 0;
+    this.currentPrice = state.currentPrice  ?? 0;
   }
-
+  
   dehydrate() {
     return {
       inPosition:    this.inPosition,
@@ -245,24 +277,26 @@ class RO15Strategy {
       currentPrice: this.currentPrice,
     };
   }
-
+  
   updateCurrentPrice(price) { this.currentPrice = price; }
-
+  
   /**
-   * Process a closed daily candle. Signals ONLY evaluated here.
+   * Process a CLOSED daily candle. Signals ONLY evaluated here.
+   * Returns signal object or null.
    */
   processClosedCandle(candle) {
     const close = candle.close;
     const date  = candle.date;
-
-    // Always roll the 10d window
+    
+    // Always update rolling 10d window
     this.tenDayPrices.push(close);
     if (this.tenDayPrices.length > this.reentryLookback) this.tenDayPrices.shift();
-    const window10dHigh = this.tenDayPrices.length > 0 ? Math.max(...this.tenDayPrices) : close;
-
+    const window10dHigh = Math.max(...this.tenDayPrices);
+    
     if (!this.inPosition) {
-      // FLAT — check re-entry
+      // ── FLAT: check re-entry ──
       if (this.daysSinceExit > 0 && close > this.tenDayHigh) {
+        // ENTRY
         this.inPosition    = true;
         this.entryPrice    = close;
         this.peakPrice     = close;
@@ -271,58 +305,125 @@ class RO15Strategy {
         this.daysSinceExit = 0;
         this.tenDayHigh    = 0;
         this.tenDayPrices  = [close];
-        const sig = { action: 'BUY', price: close, date, return: null,
-          reason: `re-entry (>${this.reentryLookback}d high ${this.tenDayHigh.toFixed(2)})` };
-        this._alert(sig); return sig;
+        
+        const signal = {
+          action:  'BUY',
+          price:   close,
+          date,
+          return:  null,
+          reason:  `re-entry (>${this.reentryLookback}d high ${this.tenDayHigh.toFixed(2)})`,
+        };
+        this._alert(signal);
+        return signal;
       } else {
         this.daysSinceExit++;
         this.tenDayHigh = Math.max(this.tenDayHigh || 0, close);
-        this.lastEvent  = 'FLAT'; return null;
+        this.lastEvent  = 'FLAT';
+        return null;
       }
     } else {
-      // IN POSITION — update peak, check trailing stop
+      // ── IN POSITION: update peak + trailing stop ──
       this.peakPrice = Math.max(this.peakPrice, close);
       const trailLevel = this.peakPrice * (1 - this.trailPct);
+      
       if (close < trailLevel) {
+        // EXIT — trailing stop triggered
         const grossReturn = (close - this.entryPrice) / this.entryPrice;
-        const fee          = close * (this.feePct / 100);
-        const netReturn    = grossReturn - fee / this.entryPrice;
-        this.realizedPnL  += netReturn;
-        this.cumFees      += fee;
+        const fee         = close * (this.feePct / 100);
+        const netReturn   = grossReturn - fee / this.entryPrice;
+        
+        this.realizedPnL += netReturn;
+        this.cumFees     += fee;
         this.inPosition    = false;
         this.lastEvent     = 'EXIT';
         this.daysSinceExit = 0;
         this.tenDayHigh    = window10dHigh;
         this.tenDayPrices  = [];
         const exitedPeak   = this.peakPrice;
-        this.peakPrice     = 0; this.entryPrice = 0;
-        const sig = { action: 'SELL', price: close, date, return: netReturn,
-          reason: `trailing stop (peak ${exitedPeak.toFixed(2)}, trail ${trailLevel.toFixed(2)})` };
-        this._alert(sig); return sig;
+        this.peakPrice     = 0;
+        this.entryPrice    = 0;
+        
+        const signal = {
+          action:  'SELL',
+          price:   close,
+          date,
+          return:  netReturn,
+          reason:  `trailing stop (peak ${exitedPeak.toFixed(2)}, trail ${trailLevel.toFixed(2)})`,
+        };
+        this._alert(signal);
+        return signal;
       } else {
-        this.lastEvent = 'HOLD'; return null;
+        this.lastEvent = 'HOLD';
+        return null;
       }
     }
   }
-
-  _alert(sig) {
+  
+  _alert(signal) {
     if (this._alertSilence > 0) { this._alertSilence--; return; }
-    if (this._lastAlertEvent === sig.action) { this._alertSilence = 2; return; }
-    this._lastAlertEvent = sig.action;
-    const pnlStr = sig.return !== null
-      ? ` | PnL: ${(sig.return*100).toFixed(2)}% | Total: ${(this.realizedPnL*100).toFixed(2)}%` : '';
-    logAlert(this.asset, sig.action === 'BUY' ? '🟢 BUY' : '🔴 SELL', `${sig.date} @ ${sig.price.toFixed(4)} | ${sig.reason}${pnlStr}`);
+    if (this._lastAlertEvent === signal.action) { this._alertSilence = 2; return; }
+    this._lastAlertEvent = signal.action;
+    
+    const pnlStr = signal.return !== null
+      ? ` | PnL: ${(signal.return*100).toFixed(2)}% | Total: ${(this.realizedPnL*100).toFixed(2)}%`
+      : '';
+    logAlert(this.asset, `${signal.action === 'BUY' ? '🟢 BUY' : '🔴 SELL'}`, 
+      `${signal.date} @ ${signal.price.toFixed(4)} | ${signal.reason}${pnlStr}`);
+    
+    // Structured signal log
+    logSignal(this.asset, {
+      ...signal,
+      realizedPct: this.realizedPnL,
+      trades: this.trades,
+    });
   }
-
-  // ── Monitoring helpers ──
-
-  trailLevel()    { return this.inPosition ? this.peakPrice * (1 - this.trailPct) : 0; }
-  distToStop()    { return this.inPosition && this.currentPrice > 0 ? ((this.currentPrice - this.trailLevel()) / this.currentPrice) * 100 : null; }
-  unrealizedPct() { return (this.inPosition && this.entryPrice > 0 && this.currentPrice > 0) ? ((this.currentPrice - this.entryPrice) / this.entryPrice) * 100 : 0; }
-  unrealizedEUR() { return (this.unrealizedPct() / 100) * this.initialCapital; }
-  realizedPct()   { return this.realizedPnL * 100; }
-  realizedEUR()   { return this.realizedPnL * this.initialCapital; }
-  equity()        { return this.initialCapital * (1 + this.realizedPnL + this.unrealizedPct() / 100); }
+  
+  getTrailLevel() { return this.inPosition ? this.peakPrice * (1 - this.trailPct) : 0; }
+  
+  distanceToStopPct() {
+    if (!this.inPosition || this.currentPrice === 0) return null;
+    return ((this.currentPrice - this.getTrailLevel()) / this.currentPrice) * 100;
+  }
+  
+  unrealizedPnL() {
+    if (!this.inPosition || this.currentPrice === 0 || this.entryPrice === 0) return 0;
+    return (this.currentPrice - this.entryPrice) / this.entryPrice;
+  }
+  
+  currentEquity() {
+    return this.initialCapital * (1 + this.realizedPnL + this.unrealizedPnL());
+  }
+  
+  statusRow() {
+    const unreal       = this.unrealizedPnL();
+    const unrealPct    = unreal * 100;
+    const unrealEUR    = unreal * this.initialCapital;
+    const realizedPct  = this.realizedPnL * 100;
+    const realizedEUR  = this.realizedPnL * this.initialCapital;
+    const trail        = this.getTrailLevel();
+    const distPct      = this.distanceToStopPct();
+    const tenDayStr    = (!this.inPosition && this.tenDayHigh > 0)
+      ? ` | 10d high: ${this.tenDayHigh.toFixed(2)}`
+      : '';
+    
+    return {
+      asset:         this.asset,
+      position:      this.inPosition ? 'LONG' : 'FLAT',
+      currentPrice:  this.currentPrice,
+      peakPrice:     this.peakPrice,
+      trailLevel:    trail,
+      distToStopPct: distPct,
+      equity:        this.currentEquity(),
+      unrealizedPct,
+      unrealizedEUR,
+      realizedPct,
+      realizedEUR,
+      lastEvent:     this.lastEvent,
+      trades:        this.trades,
+      cumFees:       this.cumFees,
+      tenDayInfo:    tenDayStr,
+    };
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -335,183 +436,296 @@ class PaperEngine {
     this.lastPrices    = {};
     this.lastDailyDate = {};
     this.startedAt     = new Date().toISOString();
-    for (const a of CONFIG.assets) {
-      this.strategies[a]    = new RO15Strategy(a);
-      this.lastPrices[a]    = 0;
-      this.lastDailyDate[a] = null;
+    
+    for (const asset of CONFIG.assets) {
+      this.strategies[asset]    = new RO15Strategy(asset);
+      this.lastPrices[asset]    = 0;
+      this.lastDailyDate[asset] = null;
     }
   }
-
+  
   async initialize() {
     log('═'.repeat(78));
-    log('RO15 LIVE SHADOW VALIDATOR — initializing');
+    log('RO15 LIVE SHADOW VALIDATOR — v3 initializing');
     log(`Assets: ${CONFIG.assets.join(', ')}`);
-    log(`Spec: trail=${CONFIG.trailPct*100}% | fee=${CONFIG.feePct}% | slippage=${CONFIG.slippagePct}%`);
-    log(`Re-entry: price > ${CONFIG.reentryLookback}d high | Mode: SHADOW ONLY`);
-    log(`Poll: every ${CONFIG.pollIntervalMs/1000/60} min | Signals: DAILY CANDLE CLOSES ONLY`);
+    log(`Spec: trail=${CONFIG.trailPct*100}% | fee=${CONFIG.feePct}% | slippage=0%`);
+    log(`Re-entry: price > ${CONFIG.reentryLookback}d high | Mode: SHADOW ONLY (no real orders)`);
+    log(`Poll interval: ${CONFIG.pollIntervalMs/1000/60}min | Signals: DAILY CANDLE CLOSES ONLY`);
+    log(`Log retention: ${CONFIG.logRetentionDays} days | Signal log max: ${CONFIG.signalLogMaxLines} lines`);
     log('═'.repeat(78));
-
+    
+    const globalState = loadState();
+    
     for (const asset of CONFIG.assets) {
       let daily;
-      try { daily = await fetchDailyCandles(asset, CONFIG.lookbackDays); }
-      catch(e) { log(`FATAL: Cannot fetch ${asset}: ${e.message}`, 'ERROR'); throw e; }
-
+      try {
+        daily = await fetchDailyCandles(asset, CONFIG.lookbackDays);
+      } catch(e) {
+        log(`FATAL: Cannot fetch ${asset}: ${e.message}`, 'ERROR');
+        throw e;
+      }
+      
       const latestCandle        = daily[daily.length - 1];
-      this.lastPrices[asset]    = latestCandle.close;
+      const latestPrice         = latestCandle.close;
+      this.lastPrices[asset]    = latestPrice;
       this.lastDailyDate[asset] = latestCandle.date;
-
+      
       const saved = loadAssetState(asset);
       if (saved) {
         log(`  ${asset}: restoring state from disk`);
         this.strategies[asset].hydrate(saved);
-        this.strategies[asset].updateCurrentPrice(latestCandle.close);
-        // Sync peak with any new highs since last poll
+        this.strategies[asset].updateCurrentPrice(latestPrice);
+        
+        // If still in position, update peak with any recent new highs
         if (this.strategies[asset].inPosition) {
           for (const c of daily.slice(-5)) {
-            this.strategies[asset].peakPrice = Math.max(this.strategies[asset].peakPrice, c.close);
+            this.strategies[asset].peakPrice = Math.max(
+              this.strategies[asset].peakPrice, c.close
+            );
           }
         }
       } else {
-        log(`  ${asset}: cold start — processing ${daily.length} historical candles`);
-        for (const c of daily) this.strategies[asset].processClosedCandle(c);
+        log(`  ${asset}: cold start — processing ${daily.length} historical daily candles`);
+        
+        for (const candle of daily) {
+          this.strategies[asset].processClosedCandle(candle);
+        }
+        
+        // Research spec: always start IN position
         const s = this.strategies[asset];
-        if (!s.inPosition) {
-          s.inPosition = true; s.entryPrice = latestCandle.close; s.peakPrice = latestCandle.close;
-          s.currentPrice = latestCandle.close;
+        if (!s.inPosition && daily.length > 0) {
+          s.inPosition   = true;
+          s.entryPrice   = latestPrice;
+          s.peakPrice    = latestPrice;
+          s.currentPrice = latestPrice;
           s.tenDayPrices = daily.slice(-CONFIG.reentryLookback).map(c => c.close);
-          s.tenDayHigh = Math.max(...s.tenDayPrices);
-          s.trades++; s.lastEvent = 'ENTRY';
-          logAlert(asset, '🟢 BUY (cold start)', `forced entry @ ${latestCandle.close.toFixed(4)}`);
+          s.tenDayHigh   = Math.max(...s.tenDayPrices);
+          s.trades++;
+          s.lastEvent    = 'ENTRY';
+          logAlert(asset, '🟢 BUY (cold start)', `forced entry @ ${latestPrice.toFixed(4)}`);
+        } else {
+          s.currentPrice = latestPrice;
         }
       }
+      
       saveAssetState(asset, this.strategies[asset].dehydrate());
     }
-
-    saveState({ assets: CONFIG.assets, trailPct: CONFIG.trailPct, startedAt: this.startedAt,
-                lastUpdate: new Date().toISOString(), lastPrices: this.lastPrices });
+    
+    saveState({
+      assets:     CONFIG.assets,
+      trailPct:   CONFIG.trailPct,
+      startedAt:  this.startedAt,
+      lastUpdate: new Date().toISOString(),
+      lastPrices: this.lastPrices,
+    });
+    
+    this.rollingCleanup();
     this.printDailySummary();
     log('Initialization complete. Live polling active in SHADOW MODE.');
   }
-
+  
   async poll() {
+    const now = new Date();
     log(`\n${'─'.repeat(78)}`);
-    log(`POLL @ ${new Date().toISOString()}`);
-    let anyNew = false;
-
+    log(`POLL @ ${now.toISOString()}`);
+    
+    let anyNewCandle = false;
+    
     for (const asset of CONFIG.assets) {
       let daily;
-      try { daily = await fetchDailyCandles(asset, 3); }
-      catch(e) { log(`  ${asset}: API error — ${e.message}`, 'ERROR'); continue; }
-
+      try {
+        daily = await fetchDailyCandles(asset, 3);
+      } catch(e) {
+        log(`  ${asset}: API error — ${e.message}`, 'ERROR');
+        if (this.strategies[asset].currentPrice === 0) {
+          this.strategies[asset].currentPrice = this.lastPrices[asset];
+        }
+        continue;
+      }
+      
       const latestCandle = daily[daily.length - 1];
       const prevCandle   = daily[daily.length - 2];
       const latestDate   = latestCandle.date;
       const lastKnown    = this.lastDailyDate[asset];
-
+      
       if (latestDate !== lastKnown && prevCandle) {
-        anyNew = true;
+        // New closed candle!
+        anyNewCandle = true;
         log(`  ${asset}: 📅 new closed candle ${prevCandle.date} (was ${lastKnown})`);
-        const sig = this.strategies[asset].processClosedCandle(prevCandle);
+        
+        const signal = this.strategies[asset].processClosedCandle(prevCandle);
         this.lastDailyDate[asset] = prevCandle.date;
-        this.lastPrices[asset]    = prevCandle.close;
+        this.lastPrices[asset]   = prevCandle.close;
         this.strategies[asset].currentPrice = prevCandle.close;
-        if (sig) log(`  ${asset}: ⚡ SIGNAL → ${sig.action} | ${sig.reason}`);
-        // Track today's in-progress candle for peak (no signal)
+        
+        if (signal) {
+          log(`  ${asset}: ⚡ SIGNAL → ${signal.action} | ${signal.reason}`);
+        }
+        
+        // Track today's ongoing candle for peak updates (no signal)
         if (latestCandle.close !== prevCandle.close) {
-          this.strategies[asset].peakPrice = Math.max(this.strategies[asset].peakPrice, latestCandle.close);
+          this.strategies[asset].peakPrice = Math.max(
+            this.strategies[asset].peakPrice, latestCandle.close
+          );
           this.strategies[asset].currentPrice = latestCandle.close;
           this.lastPrices[asset] = latestCandle.close;
         }
       } else {
+        // Same day — just update current price
         this.strategies[asset].currentPrice = latestCandle.close;
         this.lastPrices[asset]             = latestCandle.close;
         log(`  ${asset}: ⏳ ${latestDate} (no new candle yet) | price: ${latestCandle.close.toFixed(4)}`);
       }
+      
       saveAssetState(asset, this.strategies[asset].dehydrate());
     }
-
-    saveState({ assets: CONFIG.assets, trailPct: CONFIG.trailPct, startedAt: this.startedAt,
-                lastUpdate: new Date().toISOString(), lastPrices: this.lastPrices });
-    if (!anyNew) log('  (no new closed candles — signals skipped)');
+    
+    this.rollingCleanup();
+    
+    saveState({
+      assets:     CONFIG.assets,
+      trailPct:   CONFIG.trailPct,
+      startedAt:  this.startedAt,
+      lastUpdate: new Date().toISOString(),
+      lastPrices: this.lastPrices,
+    });
+    
+    if (!anyNewCandle) {
+      log(`  (no new closed candles this poll — signals skipped)`);
+    }
+    
     this.printDailySummary();
     this.writeDailySnapshot();
   }
-
+  
   printDailySummary() {
-    const total = CONFIG.assets.reduce((s, a) => s + this.strategies[a].equity(), 0);
-    const today = new Date().toISOString().slice(0,10);
-
+    const totalEquity = CONFIG.assets.reduce((s, a) => s + this.strategies[a].currentEquity(), 0);
+    const today      = new Date().toISOString().slice(0,10);
+    const uptimeH    = ((Date.now() - new Date(this.startedAt).getTime()) / 3600000).toFixed(1);
+    
     log('');
     log('┌──────────────────────────────────────────────────────────────────────────────────────────────┐');
-    log(`│  RO15 SHADOW MONITOR  |  ${today}  |  SHADOW MODE                                           │`);
+    log(`│  RO15 SHADOW MONITOR  |  ${today}  |  SHADOW MODE  |  uptime: ${uptimeH}h  │`);
     log('├──────────┬────────┬──────────┬──────────┬──────────┬──────────┬──────────┬─────────────────────┤');
     log('│ ASSET    │ POS    │ PRICE    │ PEAK     │ TRAIL    │ DIST     │ EQUITY   │ LAST EVENT          │');
     log('├──────────┼────────┼──────────┼──────────┼──────────┼──────────┼──────────┼─────────────────────┤');
-
+    
     for (const asset of CONFIG.assets) {
       const s   = this.strategies[asset];
-      const pos = s.inPosition ? 'LONG' : 'FLAT';
-      const priceStr  = s.currentPrice > 0 ? s.currentPrice.toFixed(2)          : '—';
-      const peakStr   = s.peakPrice    > 0 ? s.peakPrice.toFixed(2)             : '—';
-      const trailStr  = s.trailLevel() > 0 ? s.trailLevel().toFixed(2)         : '—';
-      const distStr   = s.distToStop() !== null ? `${s.distToStop().toFixed(1)}%` : '—';
-
-      log(`│ ${asset.padEnd(8)} │ ${pos.padEnd(4)} │ ${priceStr.padEnd(8)} │ ${peakStr.padEnd(8)} │ ${trailStr.padEnd(8)} │ ${distStr.padEnd(8)} │ ${s.equity().toFixed(2).padStart(8)} € │ ${s.lastEvent.padEnd(19)} │`);
-
-      if (s.inPosition) {
-        const uPct = s.unrealizedPct(), uEUR = s.unrealizedEUR();
-        const rPct = s.realizedPct(),   rEUR = s.realizedEUR();
-        const uSign = uPct >= 0 ? '+' : '';
-        const rSign = rPct >= 0 ? '+' : '';
-        log(`│          │ unrealized: ${uSign}${uPct.toFixed(2)}% (${uEUR >= 0 ? '+' : ''}${uEUR.toFixed(2)} €) | realized: ${rSign}${rPct.toFixed(2)}% | trades: ${s.trades}`.padEnd(92) + ' │');
+      const row = s.statusRow();
+      
+      const priceStr  = row.currentPrice > 0 ? row.currentPrice.toFixed(2) : '—';
+      const peakStr   = row.peakPrice    > 0 ? row.peakPrice.toFixed(2)    : '—';
+      const trailStr  = row.trailLevel   > 0 ? row.trailLevel.toFixed(2)    : '—';
+      const distStr   = row.distToStopPct !== null ? `${row.distToStopPct.toFixed(1)}%` : '—';
+      
+      log(`│ ${asset.padEnd(8)} │ ${row.position.padEnd(4)} │ ${priceStr.padEnd(8)} │ ${peakStr.padEnd(8)} │ ${trailStr.padEnd(8)} │ ${distStr.padEnd(8)} │ ${row.equity.toFixed(2).padStart(8)} € │ ${row.lastEvent.padEnd(19)} │`);
+      
+      if (row.position === 'LONG') {
+        const unrealSign = row.unrealizedPct >= 0 ? '+' : '';
+        const realSign   = row.realizedPct   >= 0 ? '+' : '';
+        log(`│          │ unrealized: ${unrealSign}${row.unrealizedPct.toFixed(2)}% (${row.unrealizedEUR >= 0 ? '+' : ''}${row.unrealizedEUR.toFixed(2)} €) | realized: ${realSign}${row.realizedPct.toFixed(2)}% | trades: ${row.trades}`.padEnd(92) + '│');
       } else {
-        const rPct = s.realizedPct(), rEUR = s.realizedEUR();
-        const rSign = rPct >= 0 ? '+' : '';
-        const tenDayStr = s.tenDayHigh > 0 ? ` | 10d high: ${s.tenDayHigh.toFixed(2)}` : '';
-        log(`│          │ realized: ${rSign}${rPct.toFixed(2)}% (${rEUR >= 0 ? '+' : ''}${rEUR.toFixed(2)} €) | trades: ${s.trades}${tenDayStr}`.padEnd(92) + ' │');
+        const realSign = row.realizedPct >= 0 ? '+' : '';
+        log(`│          │ realized: ${realSign}${row.realizedPct.toFixed(2)}% (${row.realizedEUR >= 0 ? '+' : ''}${row.realizedEUR.toFixed(2)} €) | trades: ${row.trades}${row.tenDayInfo}`.padEnd(92) + '│');
       }
     }
-
+    
     log('├──────────┴────────┴──────────┴──────────┴──────────┴──────────┴──────────┴─────────────────────┤');
-    log(`│  TOTAL PORTFOLIO: ${total.toFixed(2)} €  |  started: ${this.startedAt.slice(0,10)}  |  validation period: 2–4 weeks  │`);
+    log(`│  TOTAL PORTFOLIO: ${totalEquity.toFixed(2)} €  |  started: ${this.startedAt.slice(0,10)}  |  validation period: 2–4 weeks  │`);
     log('└────────────────────────────────────────────────────────────────────────────────────────────────────┘');
   }
-
+  
   writeDailySnapshot() {
     const date     = new Date().toISOString().slice(0,10);
-    const csvPath   = path.join(DAILY_DIR, `summary-${date}.csv`);
-    const headers   = ['timestamp','asset','position','currentPrice','peakPrice','trailLevel',
-                       'distToStopPct','equityEUR','unrealizedPct','unrealizedEUR','realizedPct',
-                       'realizedEUR','lastEvent','trades','cumFees'];
+    const dailyCsv = path.join(DAILY_DIR, `summary-${date}.csv`);
+    const headers  = ['timestamp','asset','position','currentPrice','peakPrice','trailLevel',
+                      'distToStopPct','equityEUR','unrealizedPct','unrealizedEUR','realizedPct',
+                      'realizedEUR','lastEvent','trades','cumFees'];
     const headerLine = headers.join(',');
-
+    
     for (const asset of CONFIG.assets) {
-      const s = this.strategies[asset];
-      const row = [
-        new Date().toISOString(), asset,
-        s.inPosition ? 'LONG' : 'FLAT',
-        s.currentPrice.toFixed(4),
-        s.peakPrice.toFixed(4),
-        s.trailLevel().toFixed(4),
-        s.distToStop() !== null ? s.distToStop().toFixed(4) : '',
-        s.equity().toFixed(2),
-        s.unrealizedPct().toFixed(4),
-        s.unrealizedEUR().toFixed(2),
-        s.realizedPct().toFixed(4),
-        s.realizedEUR().toFixed(2),
-        s.lastEvent, s.trades, s.cumFees.toFixed(4),
+      const s   = this.strategies[asset];
+      const row = s.statusRow();
+      
+      const rowData = [
+        new Date().toISOString(),
+        asset,
+        row.position,
+        row.currentPrice.toFixed(4),
+        row.peakPrice.toFixed(4),
+        row.trailLevel.toFixed(4),
+        row.distToStopPct !== null ? row.distToStopPct.toFixed(4) : '',
+        row.equity.toFixed(2),
+        row.unrealizedPct.toFixed(4),
+        row.unrealizedEUR.toFixed(2),
+        row.realizedPct.toFixed(4),
+        row.realizedEUR.toFixed(2),
+        row.lastEvent,
+        row.trades,
+        s.cumFees.toFixed(4),
       ].join(',');
-      if (!fs.existsSync(csvPath)) fs.writeFileSync(csvPath, headerLine + '\n');
-      fs.appendFileSync(csvPath, row + '\n');
+      
+      if (!fs.existsSync(dailyCsv)) fs.writeFileSync(dailyCsv, headerLine + '\n');
+      fs.appendFileSync(dailyCsv, rowData + '\n');
     }
   }
-
+  
+  // ─────────────────────────────────────────────────────────────
+  // Rolling Log Cleanup
+  // ─────────────────────────────────────────────────────────────
+  
+  rollingCleanup() {
+    const now      = Date.now();
+    const maxAgeMs = CONFIG.logRetentionDays * 24 * 3600 * 1000;
+    const maxLines = CONFIG.signalLogMaxLines;
+    
+    // Cleanup validator log files (keep last N days)
+    try {
+      const validatorLogs = fs.readdirSync(LOG_DIR).filter(f => f.startsWith('validator-') && f.endsWith('.log'));
+      for (const f of validatorLogs) {
+        const fpath = path.join(LOG_DIR, f);
+        const ageMs = now - fs.statSync(fpath).mtimeMs;
+        if (ageMs > maxAgeMs) { fs.unlinkSync(fpath); log(`Cleaned up old log: ${f}`); }
+      }
+    } catch(e) {}
+    
+    // Cleanup old daily CSV files
+    try {
+      const dailyFiles = fs.readdirSync(DAILY_DIR).filter(f => f.startsWith('summary-') && f.endsWith('.csv'));
+      for (const f of dailyFiles) {
+        const fpath = path.join(DAILY_DIR, f);
+        const ageMs = now - fs.statSync(fpath).mtimeMs;
+        if (ageMs > maxAgeMs) { fs.unlinkSync(fpath); log(`Cleaned up old daily CSV: ${f}`); }
+      }
+    } catch(e) {}
+    
+    // Rotate signal log if too many lines
+    try {
+      if (fs.existsSync(SIGNAL_LOG)) {
+        const lines = fs.readFileSync(SIGNAL_LOG, 'utf8').split('\n').filter(l => l.trim());
+        if (lines.length > maxLines) {
+          const rotated = SIGNAL_LOG.replace('.csv', `-${new Date().toISOString().slice(0,10)}.csv`);
+          fs.writeFileSync(rotated, lines.join('\n') + '\n');
+          fs.writeFileSync(SIGNAL_LOG, lines[0] + '\n' + lines.slice(-(maxLines / 2)).join('\n') + '\n');
+          log(`Signal log rotated: ${lines.length} → ${maxLines/2} lines`);
+        }
+      }
+    } catch(e) {}
+  }
+  
   startLive() {
     log(`\n=== Live polling started (SHADOW MODE) ===`);
     log(`Interval: every ${CONFIG.pollIntervalMs / 1000 / 60} minutes`);
     log(`Signals: evaluated ONLY at daily candle closes`);
+    log(`Log retention: ${CONFIG.logRetentionDays} days | Signal log max: ${CONFIG.signalLogMaxLines} lines`);
+    log(`State files: logs/state.json + logs/assets/{BTC,ETH}-state.json (restart-safe)`);
+    
     this.poll().catch(e => log(`Poll error: ${e.message}`, 'ERROR'));
-    setInterval(() => this.poll().catch(e => log(`Poll error: ${e.message}`, 'ERROR')), CONFIG.pollIntervalMs);
+    
+    setInterval(() => {
+      this.poll().catch(e => log(`Poll error: ${e.message}`, 'ERROR'));
+    }, CONFIG.pollIntervalMs);
   }
 }
 
@@ -521,25 +735,39 @@ class PaperEngine {
 
 function printHelp() {
   console.log(`
-RO15 Live Shadow-Mode Validator
+RO15 Live Shadow-Mode Validator v3
 
 Usage:
   node ro15-live-validator.mjs --live   ← continuous hourly polling (PM2)
   node ro15-live-validator.mjs --once   ← single poll and exit (cron)
   node ro15-live-validator.mjs --help   ← this help
 
-Mode: SHADOW ONLY — no real orders. Only signals, state, logging.
+Mode: SHADOW ONLY — no real orders. Only signals, state, and logging.
 
-State recovery: restart-safe (logs/assets/{ASSET}-state.json)
+State recovery: restart-safe.
+  logs/state.json                   — global state
+  logs/assets/{BTC,ETH}-state.json   — per-asset trading state
+  logs/signals.csv                  — structured signal log
 
 Logs:
-  logs/validator-YYYY-MM-DD.log   — daily console log
-  logs/daily/summary-YYYY-MM-DD.csv — daily equity snapshots
-  logs/alerts/{ASSET}-alerts.log  — entry/exit events
+  logs/validator-YYYY-MM-DD.log      — daily console log
+  logs/daily/summary-YYYY-MM-DD.csv  — daily equity snapshots
+  logs/alerts/{BTC,ETH}-alerts.log   — entry/exit events
+  logs/signals.csv                   — all signals (CSV)
+  logs/signals-YYYY-MM-DD.csv        — rotated signal archives
+
+Rolling cleanup: logs older than ${CONFIG.logRetentionDays} days auto-deleted.
+Signal log auto-rotates at ${CONFIG.signalLogMaxLines} lines.
 
 PM2:
   pm2 start ro15-live-validator.mjs --name ro15-live -- --live
-  pm2 save && pm2 logs ro15-live
+  pm2 save
+  pm2 logs ro15-live
+
+Systemd:
+  sudo systemctl enable /path/to/ro15-live.service
+  sudo systemctl start ro15-live
+  journalctl -u ro15-live -f
 
 Cron (one-shot hourly):
   0 * * * * cd /path/to/crypto-live-validator && node ro15-live-validator.mjs --once
@@ -548,13 +776,23 @@ Cron (one-shot hourly):
 
 async function main() {
   const args = process.argv.slice(2);
-  if (args.includes('--help') || args.includes('-h')) { printHelp(); return; }
-
+  
+  if (args.includes('--help') || args.includes('-h')) {
+    printHelp();
+    return;
+  }
+  
   const engine = new PaperEngine();
+  
   try {
     await engine.initialize();
-    if (args.includes('--live')) { engine.startLive(); }
-    else { log('One-shot mode complete.'); process.exit(0); }
+    
+    if (args.includes('--live')) {
+      engine.startLive();
+    } else {
+      log('One-shot mode. Daily check complete.');
+      process.exit(0);
+    }
   } catch(e) {
     log(`FATAL: ${e.message}`, 'ERROR');
     process.exit(1);
