@@ -1,0 +1,15 @@
+{
+  "name": "crypto-live-validator",
+  "version": "1.0.0",
+  "description": "RO15 Live/Paper Trading Validator",
+  "type": "module",
+  "main": "ro15-paper-trader.mjs",
+  "scripts": {
+    "start": "node ro15-paper-trader.mjs --live",
+    "historical": "node ro15-paper-trader.mjs --historical-only",
+    "test": "node --test ro15-paper-trader.mjs --historical-only"
+  },
+  "keywords": ["crypto", "trading", "paper", "backtest", "validation"],
+  "author": "",
+  "license": "MIT"
+}
