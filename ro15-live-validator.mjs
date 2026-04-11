@@ -395,34 +395,55 @@ class RO15Strategy {
   }
   
   statusRow() {
-    const unreal       = this.unrealizedPnL();
-    const unrealPct    = unreal * 100;
-    const unrealEUR    = unreal * this.initialCapital;
-    const realizedPct  = this.realizedPnL * 100;
-    const realizedEUR  = this.realizedPnL * this.initialCapital;
-    const trail        = this.getTrailLevel();
-    const distPct      = this.distanceToStopPct();
-    const tenDayStr    = (!this.inPosition && this.tenDayHigh > 0)
+    try {
+      const unreal       = this.unrealizedPnL();
+      const unrealPct    = unreal * 100;
+      const unrealEUR    = unreal * this.initialCapital;
+      const realizedPct  = this.realizedPnL * 100;
+      const realizedEUR  = this.realizedPnL * this.initialCapital;
+      const trail        = this.getTrailLevel();
+      const distPct      = this.distanceToStopPct();
+      const tenDayStr    = (!this.inPosition && this.tenDayHigh > 0)
       ? ` | 10d high: ${this.tenDayHigh.toFixed(2)}`
       : '';
-    
-    return {
-      asset:         this.asset,
-      position:      this.inPosition ? 'LONG' : 'FLAT',
-      currentPrice:  this.currentPrice,
-      peakPrice:     this.peakPrice,
-      trailLevel:    trail,
-      distToStopPct: distPct,
-      equity:        this.currentEquity(),
-      unrealizedPct: unrealPct,
-      unrealizedEUR: unrealEUR,
-      realizedPct,
-      realizedEUR,
-      lastEvent:     this.lastEvent,
-      trades:        this.trades,
-      cumFees:       this.cumFees,
-      tenDayInfo:    tenDayStr,
-    };
+
+      return {
+        asset:         this.asset,
+        position:      this.inPosition ? 'LONG' : 'FLAT',
+        currentPrice:  this.currentPrice  ?? 0,
+        peakPrice:     this.peakPrice     ?? 0,
+        trailLevel:    trail             ?? 0,
+        distToStopPct: distPct          ?? null,
+        equity:        this.currentEquity() ?? this.initialCapital,
+        unrealizedPct: unrealPct        ?? 0,
+        unrealizedEUR: unrealEUR        ?? 0,
+        realizedPct:   realizedPct      ?? 0,
+        realizedEUR:   realizedEUR      ?? 0,
+        lastEvent:     this.lastEvent   ?? 'INIT',
+        trades:        this.trades      ?? 0,
+        cumFees:       this.cumFees     ?? 0,
+        tenDayInfo:    tenDayStr,
+      };
+    } catch(e) {
+      // Defensive: return safe fallback if anything goes wrong
+      return {
+        asset:        this.asset,
+        position:     this.inPosition ? 'LONG' : 'FLAT',
+        currentPrice: this.currentPrice ?? 0,
+        peakPrice:    this.peakPrice    ?? 0,
+        trailLevel:   0,
+        distToStopPct: null,
+        equity:       this.initialCapital,
+        unrealizedPct: 0,
+        unrealizedEUR: 0,
+        realizedPct:   0,
+        realizedEUR:   0,
+        lastEvent:     this.lastEvent  ?? 'INIT',
+        trades:        this.trades     ?? 0,
+        cumFees:       this.cumFees    ?? 0,
+        tenDayInfo:    '',
+      };
+    }
   }
 }
 
