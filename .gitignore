@@ -1,0 +1,10 @@
+# Runtime data — never commit
+logs/
+*.log
+
+# Editor
+.DS_Store
+*.swp
+
+# State (asset-specific, auto-generated)
+state.json

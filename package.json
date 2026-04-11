@@ -1,15 +1,14 @@
 {
   "name": "crypto-live-validator",
   "version": "1.0.0",
-  "description": "RO15 Live/Paper Trading Validator",
+  "description": "RO15 live shadow-mode validator — production deployment",
   "type": "module",
-  "main": "ro15-paper-trader.mjs",
   "scripts": {
-    "start": "node ro15-paper-trader.mjs --live",
-    "historical": "node ro15-paper-trader.mjs --historical-only",
-    "test": "node --test ro15-paper-trader.mjs --historical-only"
+    "start": "node ro15-live-validator.mjs --live",
+    "once": "node ro15-live-validator.mjs",
+    "test": "node --check ro15-live-validator.mjs"
   },
-  "keywords": ["crypto", "trading", "paper", "backtest", "validation"],
-  "author": "",
-  "license": "MIT"
+  "engines": {
+    "node": ">=18"
+  }
 }

@@ -1,0 +1,696 @@
+#!/usr/bin/env node
+/**
+ * RO15 Live/Paper Trading Validator (CORRECTED)
+ * 
+ * Strategy: RiskOverlay-15% trailing stop (EXACT match research engine-v5.mjs)
+ * - Always invested (start with BUY)
+ * - Track peak price since entry
+ * - Exit when price drops 15% below peak
+ * - Re-entry when price breaks 10-day high (since exit)
+ * - Always in market (LONG or FLAT, never cash)
+ * 
+ * Data: Binance public API (no API key)
+ * Assets: BTC, ETH
+ * Timeframe: 1h candles
+ */
+
+import https from 'https';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const LOG_DIR = path.join(__dirname, 'logs');
+const CSV_PATH = path.join(LOG_DIR, 'ro15-trades.csv');
+const STATE_PATH = path.join(LOG_DIR, 'state.json');
+const DAILY_DIR = path.join(LOG_DIR, 'daily');
+
+// ─────────────────────────────────────────────────────────────
+// Configuration
+// ─────────────────────────────────────────────────────────────
+
+const CONFIG = {
+  assets: ['BTC', 'ETH'],
+  trailPct: 0.15,           // 15% trailing stop (RO15)
+  reentryLookback: 10,      // 10 calendar days for re-entry high
+  pollIntervalMs: 60 * 60 * 1000, // 1 hour between checks
+  initialCapital: 10000,    // USDT (paper money)
+  feePct: 0.1,              // 0.1% trading fee
+  slippagePct: 0.05,        // 0.05% slippage
+  dataPointsHistorical: 720, // ~30 days of 1h candles for warmup
+  dataPointsLive: 2,        // Latest candle only for live updates
+};
+
+// ─────────────────────────────────────────────────────────────
+// Utilities
+// ─────────────────────────────────────────────────────────────
+
+function log(msg) {
+  const ts = new Date().toISOString();
+  console.log(`[${ts}] ${msg}`);
+}
+
+function formatNumber(n, decimals = 2) {
+  return Number(n).toFixed(decimals);
+}
+
+function getDateDaysAgo(days) {
+  const d = new Date();
+  d.setDate(d.getDate() - days);
+  return d;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Binance API
+// ─────────────────────────────────────────────────────────────
+
+function fetchBinanceKlines(symbol, interval = '1h', limit = 168) {
+  return new Promise((resolve, reject) => {
+    const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}USDT&interval=${interval}&limit=${limit}`;
+    https.get(url, { headers: { 'Accept': 'application/json' } }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          // Binance kline format: [openTime, open, high, low, close, volume, closeTime, ...]
+          const candles = parsed.map(k => ({
+            openTime: k[0],
+            open: parseFloat(k[1]),
+            high: parseFloat(k[2]),
+            low: parseFloat(k[3]),
+            close: parseFloat(k[4]),
+            volume: parseFloat(k[5]),
+            closeTime: k[6],
+          }));
+          resolve(candles);
+        } catch (e) {
+          reject(new Error(`Failed to parse Binance response: ${e.message}`));
+        }
+      });
+    }).on('error', reject);
+  });
+}
+
+function getSymbol(asset) {
+  const map = { BTC: 'BTC', ETH: 'ETH' };
+  return map[asset] || asset;
+}
+
+// ─────────────────────────────────────────────────────────────
+// CSV Logging
+// ─────────────────────────────────────────────────────────────
+
+const CSV_HEADERS = [
+  'timestamp',
+  'asset',
+  'price',
+  'position',
+  'peakPrice',
+  'trailLevel',
+  'equity',
+  'unrealizedPnL',
+  'realizedPnL',
+  'event',
+  'tradeReturn',
+  'cumFees',
+].join(',');
+
+function initCSV() {
+  if (!fs.existsSync(LOG_DIR)) {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+  }
+  if (!fs.existsSync(DAILY_DIR)) {
+    fs.mkdirSync(DAILY_DIR, { recursive: true });
+  }
+  if (!fs.existsSync(CSV_PATH)) {
+    fs.writeFileSync(CSV_PATH, CSV_HEADERS + '\n');
+    log(`CSV initialized: ${CSV_PATH}`);
+  }
+}
+
+function appendCSV(row) {
+  const values = [
+    row.timestamp,
+    row.asset,
+    formatNumber(row.price, 4),
+    row.position ? 'LONG' : 'FLAT',
+    formatNumber(row.peakPrice, 4),
+    formatNumber(row.trailLevel, 4),
+    formatNumber(row.equity, 2),
+    formatNumber(row.unrealizedPnL, 2),
+    formatNumber(row.realizedPnL, 2),
+    row.event,
+    row.tradeReturn ? formatNumber(row.tradeReturn * 100, 2) + '%' : '',
+    formatNumber(row.cumFees, 2),
+  ].join(',');
+  fs.appendFileSync(CSV_PATH, values + '\n');
+}
+
+// ─────────────────────────────────────────────────────────────
+// State Management (CORRECTED: matches research exactly)
+// ─────────────────────────────────────────────────────────────
+
+function loadState() {
+  try {
+    if (fs.existsSync(STATE_PATH)) {
+      const state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+      log(`State loaded from ${STATE_PATH}`);
+      return state;
+    }
+  } catch (e) {
+    log(`Warning: Could not load state: ${e.message}`);
+  }
+  return null;
+}
+
+function saveState(state) {
+  try {
+    fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
+  } catch (e) {
+    log(`Error: Could not save state: ${e.message}`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Daily Summary
+// ─────────────────────────────────────────────────────────────
+
+function saveDailySummary(summaries) {
+  const today = new Date().toISOString().slice(0, 10);
+  const dailyPath = path.join(DAILY_DIR, `${today}.json`);
+  
+  try {
+    const existing = fs.existsSync(dailyPath) 
+      ? JSON.parse(fs.readFileSync(dailyPath, 'utf8'))
+      : { date: today, assets: {} };
+    
+    for (const [asset, data] of Object.entries(summaries)) {
+      existing.assets[asset] = data;
+    }
+    
+    fs.writeFileSync(dailyPath, JSON.stringify(existing, null, 2));
+  } catch (e) {
+    log(`Error saving daily summary: ${e.message}`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// RO15 Strategy (EXACT copy from engine-v5.mjs)
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * RO15 Strategy Implementation (EXACT match engine-v5.mjs)
+ * 
+ * Logic (verified against research):
+ * - Start: always invested (BUY at start)
+ * - Exit: price < peak * (1 - trailPct) → SELL
+ * - Re-entry: price > 10-day high (since exit) → BUY
+ * - No MA filter, no immediate re-entry
+ */
+class RO15Strategy {
+  constructor(asset, trailPct = 0.15, reentryLookback = 10) {
+    this.asset = asset;
+    this.trailPct = trailPct;
+    this.reentryLookback = reentryLookback;
+    this.reset();
+  }
+
+  reset() {
+    this.inPosition = false;
+    this.peakPrice = 0;
+    this.entryPrice = 0;
+    this.trades = 0;
+    this.realizedPnL = 0;
+    this.cumFees = 0;
+    this.lastEvent = 'INIT';
+    this.exitPrice = 0;      // Price when we exited (for re-entry calc)
+    this.exitTime = 0;       // Timestamp when we exited
+    this.priceHistory = [];   // Price history for 10-day high calculation
+  }
+
+  /**
+   * Process a candle and return signal (if any)
+   * Returns: { action, price, date, return } or null
+   */
+  processCandle(candle, prevCandle = null) {
+    const { date, price, high, low, openTime } = candle;
+    
+    // Track price history (for 10-day re-entry lookback)
+    this.priceHistory.push({ date, price, openTime });
+    // Keep only last 14 days of history (more than enough for 10-day lookback)
+    const cutoff = Date.now() - (14 * 24 * 60 * 60 * 1000);
+    this.priceHistory = this.priceHistory.filter(p => new Date(p.openTime).getTime() > cutoff);
+
+    if (!this.inPosition) {
+      // ═══ RE-ENTRY LOGIC (matches engine-v5.mjs exactly) ═══
+      // Need price > 10-day high (since exit)
+      // Calculate 10-day high from exit date onwards
+      const exitTime = this.exitTime;
+      const pricesSinceExit = this.priceHistory.filter(p => 
+        new Date(p.openTime).getTime() >= exitTime
+      );
+      
+      let reentryThreshold = price; // Default: any price works if no history
+      if (pricesSinceExit.length > 0) {
+        const tenDayHigh = Math.max(...pricesSinceExit.map(p => p.price));
+        reentryThreshold = tenDayHigh;
+      }
+      
+      if (price >= reentryThreshold) {
+        // Re-entry signal
+        this.inPosition = true;
+        this.entryPrice = price;
+        this.peakPrice = price;
+        this.trades++;
+        this.lastEvent = 'REENTRY';
+        
+        return {
+          action: 'buy',
+          price,
+          date,
+          return: null,
+          type: 'reentry',
+          reentryThreshold,
+        };
+      } else {
+        this.lastEvent = 'FLAT';
+        return null;
+      }
+    } else {
+      // ═══ IN POSITION: Update peak and check trailing stop ═══
+      if (price > this.peakPrice) {
+        this.peakPrice = price;
+      }
+      
+      const trailLevel = this.peakPrice * (1 - this.trailPct);
+      
+      if (price < trailLevel) {
+        // ═══ EXIT: Trailing stop hit ═══
+        const grossReturn = (price - this.entryPrice) / this.entryPrice;
+        const fees = price * CONFIG.feePct / 100;
+        const slippage = price * CONFIG.slippagePct / 100;
+        const netReturn = grossReturn - (fees + slippage) / this.entryPrice;
+        
+        this.realizedPnL += netReturn;
+        this.cumFees += fees + slippage;
+        this.inPosition = false;
+        this.exitPrice = price;
+        this.exitTime = openTime;
+        this.lastEvent = 'EXIT';
+        
+        return {
+          action: 'sell',
+          price,
+          date,
+          return: netReturn,
+          type: 'trail_stop',
+          trailLevel,
+          peakPrice: this.peakPrice,
+        };
+      } else {
+        // Hold
+        this.lastEvent = 'HOLD';
+        return null;
+      }
+    }
+  }
+
+  /**
+   * Initial entry (called at start of historical run)
+   */
+  initialEntry(price, date, openTime) {
+    this.inPosition = true;
+    this.entryPrice = price;
+    this.peakPrice = price;
+    this.trades = 1;
+    this.lastEvent = 'ENTRY';
+    this.exitTime = 0;
+    this.priceHistory = [{ date, price, openTime }];
+    
+    return {
+      action: 'buy',
+      price,
+      date,
+      return: null,
+      type: 'initial',
+    };
+  }
+
+  getTrailLevel() {
+    if (!this.inPosition) return 0;
+    return this.peakPrice * (1 - this.trailPct);
+  }
+
+  getUnrealizedPnL(currentPrice) {
+    if (!this.inPosition) return 0;
+    return (currentPrice - this.entryPrice) / this.entryPrice;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Paper Trading Engine
+// ─────────────────────────────────────────────────────────────
+
+class PaperTrader {
+  constructor() {
+    this.strategies = {};
+    this.equity = {};
+    this.unrealizedPnL = {};
+    this.data = {};
+    this.lastPrices = {};
+    this.lastCandles = {}; // For daily summary
+    
+    for (const asset of CONFIG.assets) {
+      this.strategies[asset] = new RO15Strategy(asset, CONFIG.trailPct, CONFIG.reentryLookback);
+      this.equity[asset] = CONFIG.initialCapital;
+      this.unrealizedPnL[asset] = 0;
+    }
+  }
+
+  /**
+   * Load historical data from Binance
+   */
+  async loadData() {
+    log('Loading market data from Binance...');
+    
+    for (const asset of CONFIG.assets) {
+      const symbol = getSymbol(asset);
+      try {
+        const candles = await fetchBinanceKlines(symbol, '1h', CONFIG.dataPointsHistorical);
+        this.data[asset] = candles.map(c => ({
+          date: new Date(c.openTime).toISOString(),
+          price: c.close,
+          high: c.high,
+          low: c.low,
+          openTime: c.openTime,
+          volume: c.volume,
+        }));
+        this.lastPrices[asset] = candles[candles.length - 1].close;
+        this.lastCandles[asset] = candles[candles.length - 1];
+        log(`  ${asset}: ${candles.length} candles loaded (${candles[0].close} → ${candles[candles.length - 1].close})`);
+      } catch (e) {
+        log(`  ERROR loading ${asset}: ${e.message}`);
+      }
+    }
+  }
+
+  /**
+   * Process a single candle for an asset
+   */
+  processCandle(asset, candle, prevCandle = null) {
+    const strategy = this.strategies[asset];
+    const signal = strategy.processCandle(candle, prevCandle);
+    
+    // Calculate unrealized PnL
+    const currentPrice = candle.price;
+    this.unrealizedPnL[asset] = strategy.getUnrealizedPnL(currentPrice);
+    
+    // Calculate equity
+    this.equity[asset] = CONFIG.initialCapital * (1 + strategy.realizedPnL + this.unrealizedPnL[asset]);
+    
+    // Log to CSV
+    appendCSV({
+      timestamp: candle.date,
+      asset,
+      price: currentPrice,
+      position: strategy.inPosition,
+      peakPrice: strategy.peakPrice,
+      trailLevel: strategy.getTrailLevel(),
+      equity: this.equity[asset],
+      unrealizedPnL: this.unrealizedPnL[asset] * CONFIG.initialCapital,
+      realizedPnL: strategy.realizedPnL * CONFIG.initialCapital,
+      event: strategy.lastEvent,
+      tradeReturn: signal?.return ?? null,
+      cumFees: strategy.cumFees,
+    });
+    
+    // Alert on entry/exit events
+    if (signal) {
+      if (signal.action === 'buy') {
+        log(`[ALERT] ${asset}: ${signal.type.toUpperCase()} at ${currentPrice} | Equity: ${this.equity[asset].toFixed(2)}`);
+      } else {
+        log(`[ALERT] ${asset}: EXIT at ${currentPrice} | Return: ${signal.return ? (signal.return * 100).toFixed(2) + '%' : '-'} | Equity: ${this.equity[asset].toFixed(2)}`);
+      }
+    }
+    
+    this.lastCandles[asset] = candle;
+    return signal;
+  }
+
+  /**
+   * Run through historical data (backtest mode)
+   */
+  async runHistorical() {
+    log('\n=== Running Historical Backtest ===');
+    
+    // Find the longest data length
+    const maxLen = Math.max(...Object.values(this.data).map(d => d.length));
+    
+    for (let i = 0; i < maxLen; i++) {
+      for (const asset of CONFIG.assets) {
+        if (!this.data[asset] || i >= this.data[asset].length) continue;
+        
+        const candle = this.data[asset][i];
+        const prevCandle = i > 0 ? this.data[asset][i - 1] : null;
+        
+        // Initial entry on first candle
+        if (i === 0) {
+          const signal = this.strategies[asset].initialEntry(candle.price, candle.date, candle.openTime);
+          this.processCandle(asset, candle, null);
+          log(`[INIT] ${asset}: Initial BUY at ${candle.price}`);
+        } else {
+          this.processCandle(asset, candle, prevCandle);
+        }
+      }
+    }
+    
+    this.printSummary();
+    this.saveCurrentState();
+    this.saveDailySummary();
+  }
+
+  /**
+   * Fetch latest candle and process
+   */
+  async fetchAndProcess() {
+    log('\n=== Live Update ===');
+    
+    const dailySummaries = {};
+    
+    for (const asset of CONFIG.assets) {
+      const symbol = getSymbol(asset);
+      try {
+        const candles = await fetchBinanceKlines(symbol, '1h', CONFIG.dataPointsLive);
+        const latest = candles[candles.length - 1];
+        const candle = {
+          date: new Date(latest.openTime).toISOString(),
+          price: latest.close,
+          high: latest.high,
+          low: latest.low,
+          openTime: latest.openTime,
+          volume: latest.volume,
+        };
+        
+        // Check if this is a new candle (different hour)
+        const lastCandle = this.lastCandles[asset];
+        if (lastCandle && new Date(lastCandle.openTime).getHours() === new Date(candle.openTime).getHours()) {
+          log(`${asset}: Same candle, skipping`);
+          continue;
+        }
+        
+        // Process the new candle
+        this.processCandle(asset, candle, lastCandle);
+        this.lastPrices[asset] = candle.price;
+        
+        // Build daily summary
+        dailySummaries[asset] = {
+          close: candle.price,
+          high: candle.high,
+          low: candle.low,
+          equity: this.equity[asset],
+          position: this.strategies[asset].inPosition ? 'LONG' : 'FLAT',
+        };
+        
+      } catch (e) {
+        log(`ERROR: ${e.message}`);
+      }
+    }
+    
+    if (Object.keys(dailySummaries).length > 0) {
+      saveDailySummary(dailySummaries);
+    }
+    
+    this.saveCurrentState();
+  }
+
+  /**
+   * Save current state to file
+   */
+  saveCurrentState() {
+    const state = {
+      timestamp: new Date().toISOString(),
+      config: {
+        trailPct: CONFIG.trailPct,
+        reentryLookback: CONFIG.reentryLookback,
+        initialCapital: CONFIG.initialCapital,
+      },
+      assets: {},
+    };
+    
+    for (const asset of CONFIG.assets) {
+      const s = this.strategies[asset];
+      state.assets[asset] = {
+        inPosition: s.inPosition,
+        entryPrice: s.entryPrice,
+        peakPrice: s.peakPrice,
+        realizedPnL: s.realizedPnL,
+        cumFees: s.cumFees,
+        trades: s.trades,
+        lastEvent: s.lastEvent,
+        exitPrice: s.exitPrice,
+        exitTime: s.exitTime,
+        equity: this.equity[asset],
+        unrealizedPnL: this.unrealizedPnL[asset],
+      };
+    }
+    
+    saveState(state);
+    return state;
+  }
+
+  /**
+   * Save daily summary
+   */
+  saveDailySummary() {
+    const summaries = {};
+    for (const asset of CONFIG.assets) {
+      const c = this.lastCandles[asset];
+      if (c) {
+        summaries[asset] = {
+          close: c.close,
+          high: c.high,
+          low: c.low,
+          equity: this.equity[asset],
+          position: this.strategies[asset].inPosition ? 'LONG' : 'FLAT',
+        };
+      }
+    }
+    saveDailySummary(summaries);
+  }
+
+  /**
+   * Start live polling
+   */
+  async startLive() {
+    log(`\n=== Starting Live Polling (every ${CONFIG.pollIntervalMs / 1000 / 60} minutes) ===`);
+    
+    // Initial state save
+    this.saveCurrentState();
+    
+    // Poll for updates
+    setInterval(async () => {
+      try {
+        await this.fetchAndProcess();
+      } catch (e) {
+        log(`Live update error: ${e.message}`);
+      }
+    }, CONFIG.pollIntervalMs);
+  }
+
+  printSummary() {
+    log('\n=== Paper Trading Summary ===');
+    for (const asset of CONFIG.assets) {
+      const strategy = this.strategies[asset];
+      log(`${asset}:`);
+      log(`  Trades: ${strategy.trades}`);
+      log(`  Realized PnL: ${(strategy.realizedPnL * 100).toFixed(2)}%`);
+      log(`  Unrealized PnL: ${(this.unrealizedPnL[asset] * 100).toFixed(2)}%`);
+      log(`  Cum. Fees: ${strategy.cumFees.toFixed(2)}`);
+      log(`  Current Equity: ${this.equity[asset].toFixed(2)}`);
+      log(`  Position: ${strategy.inPosition ? 'LONG' : 'FLAT'}`);
+      log(`  Last Event: ${strategy.lastEvent}`);
+      if (strategy.inPosition) {
+        log(`  Entry: ${strategy.entryPrice} | Peak: ${strategy.peakPrice} | Trail: ${strategy.getTrailLevel().toFixed(2)}`);
+      } else {
+        log(`  Exit Price: ${strategy.exitPrice} | Wait for re-entry > ${strategy.exitPrice}`);
+      }
+    }
+  }
+
+  /**
+   * Restore state from file
+   */
+  restoreState(savedState) {
+    if (!savedState || !savedState.assets) return;
+    
+    for (const asset of CONFIG.assets) {
+      if (!savedState.assets[asset]) continue;
+      
+      const s = savedState.assets[asset];
+      const strategy = this.strategies[asset];
+      
+      strategy.inPosition = s.inPosition;
+      strategy.entryPrice = s.entryPrice;
+      strategy.peakPrice = s.peakPrice;
+      strategy.realizedPnL = s.realizedPnL;
+      strategy.cumFees = s.cumFees;
+      strategy.trades = s.trades;
+      strategy.lastEvent = s.lastEvent;
+      strategy.exitPrice = s.exitPrice;
+      strategy.exitTime = s.exitTime;
+      
+      this.equity[asset] = s.equity ?? CONFIG.initialCapital;
+      this.unrealizedPnL[asset] = s.unrealizedPnL ?? 0;
+      
+      log(`Restored ${asset}: ${s.inPosition ? 'LONG' : 'FLAT'} @ ${s.entryPrice || s.exitPrice}`);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Main
+// ─────────────────────────────────────────────────────────────
+
+async function main() {
+  initCSV();
+  
+  const trader = new PaperTrader();
+  
+  // Try to restore state
+  const savedState = loadState();
+  if (savedState) {
+    trader.restoreState(savedState);
+  }
+  
+  const args = process.argv.slice(2);
+  
+  if (args.includes('--historical-only')) {
+    // Fresh historical run
+    await trader.loadData();
+    await trader.runHistorical();
+  } else if (args.includes('--live')) {
+    // Live mode only
+    await trader.fetchAndProcess();
+    await trader.startLive();
+  } else {
+    // Default: historical (with or without restored state), then live
+    if (!savedState) {
+      // No state file - run historical for warmup
+      await trader.loadData();
+      await trader.runHistorical();
+    } else {
+      // Have state - just fetch latest and start live
+      log('State file found, skipping historical run...');
+      await trader.fetchAndProcess();
+    }
+    log('\nHistorical run complete. Starting live polling...');
+    await trader.startLive();
+  }
+}
+
+main().catch(e => {
+  log(`Fatal error: ${e.message}`);
+  console.error(e);
+  process.exit(1);
+});
