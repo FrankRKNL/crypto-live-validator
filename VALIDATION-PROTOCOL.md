@@ -1,128 +1,165 @@
 # RO15 Live Validation Protocol
-**Start:** 2026-04-11
-**Goal:** Confirm live implementation behaves exactly like research version
-**Mode:** SHADOW ONLY — no real orders
-**Validation Period:** 2–4 weeks minimum
+**Version:** 1.0 | **Started:** 2026-04-11 | **Duration:** 2–4 weeks
+**Strategy:** RO15 (15% trailing stop, 10-day high re-entry, shadow mode)
+**Assets:** BTC, ETH | **Mode:** Paper trading (no real money)
 
 ---
 
-## 1. Daily Monitoring (automatic)
+## 1. Daily Monitoring (Automatic)
 
-Every 60 minutes (on daily candle closes only):
+### Snapshot Schedule
+- **Interval:** Every 60 minutes (live polling)
+- **Signals:** Only evaluated at daily candle closes (~01:00 UTC)
+- **Logging:** Every poll to `logs/validator-YYYY-MM-DD.log`
 
-### Per Asset Snapshot:
-| Field | BTC | ETH |
-|-------|-----|-----|
-| Position | LONG / OUT | LONG / OUT |
-| Entry Price | € | € |
-| Current Price | € | € |
-| Peak Price | € | € |
-| Trailing Stop Level | € | € |
-| Distance to Stop | % | % |
-| Unrealized PnL | € | € |
-| Realized PnL | € | € |
-| Last Event | ENTRY/EXIT/TRAIL HIT | ENTRY/EXIT/TRAIL HIT |
-| Timestamp | ISO8601 | ISO8601 |
-
----
-
-## 2. Event Logging (critical)
-
-On every entry/exit, log explicitly:
-
+### Snapshot Format (per asset)
 ```
-{
-  "event": "EXIT",
-  "asset": "BTC",
-  "reason": "TRAIL HIT" | "10D HIGH RE-ENTRY",
-  "exitPrice": 62018.29,
-  "peakAtExit": 72962.70,
-  "drawdownPct": -15.0,
-  "PnL": -180.52,
-  "fee": 0.93,
-  "netPnL": -181.45,
-  "timestamp": "2026-04-11T12:00:00Z",
-  "tradesTotal": 2,
-  "positionAfter": "OUT"
-}
+ASSET: [BTC|ETH]
+  POSITION:    LONG / OUT
+  ENTRY PRICE: €XXXXX.XX
+  CURRENT:     €XXXXX.XX
+  PEAK:        €XXXXX.XX
+  TRAIL STOP:  €XXXXX.XX
+  DISTANCE:    XX.X% (distance to stop)
+  UNREALIZED:  +X.XX% (+€XX.XX)
+  REALIZED:    +X.XX% (+€XX.XX)
+  TRADES:      X
+  LAST EVENT:  [ENTRY|EXIT|TRAIL_HIT|REENTRY]
+  TIMESTAMP:   YYYY-MM-DDTHH:MM:SSZ
+```
+
+### Equity Snapshot
+```
+TOTAL PORTFOLIO: €XXXXX.XX
+DAILY CHANGE:    +€XX.XX (+X.XX%)
+DRAWDOWN:        XX.X% from ATH
+VALIDATION DAY:  X/14
 ```
 
 ---
 
-## 3. State Integrity Tests (manual, 2x weekly)
+## 2. Event Logging (Critical)
 
-**Test procedure:**
-1. `kill [PID]` — hard stop
-2. Wait 5 seconds
-3. `node --live validator.mjs` — restart
-4. Verify from logs/state.json:
-   - Position unchanged
-   - Peak unchanged
-   - Trail level unchanged
-   - Unrealized PnL consistent with prices
+Every entry/exit MUST log:
+- **Reason:** TRAIL_HIT / 10D_HIGH_REENTRY / MANUAL
+- **Peak at exit:** Price when exit triggered
+- **Exact drawdown:** (peak - exit price) / peak * 100
+- **PnL per trade:** €XX.XX (%)
 
-**Pass criteria:** All three values within ±0.1% of pre-restart values.
-
----
-
-## 4. Exit Validation (most important)
-
-At first real exit event:
-
-| Check | Criteria | Status |
-|-------|----------|--------|
-| Exit price | Within ±1% of 15% drawdown from peak | PENDING |
-| No duplicate exit events | Single EXIT logged | PENDING |
-| No state glitch | Position=OUT, realizedPnL updated | PENDING |
-| Trail level correct | Was peak × 0.85 | PENDING |
+### Trade Log Format
+```csv
+timestamp,asset,event,entry_price,exit_price,peak,drawdown,pnl_pct,pnl_eur,reason
+2026-04-11T08:18:00Z,BTC,ENTRY,72770.73,–,72962.70,–,–,–,Initial entry
+```
 
 ---
 
-## 5. Re-entry Validation
+## 3. State Integrity Tests (2x manual)
 
-After first exit:
+### Test Procedure
+1. Restart validator: `kill <PID> && node ro15-live-validator.mjs --live`
+2. Compare state before/after restart:
+   - Position unchanged ✓/✗
+   - Peak unchanged ✓/✗
+   - Trailing stop level unchanged ✓/✗
+   - Equity within ±€1 ✓/✗
 
-| Check | Criteria | Status |
-|-------|----------|--------|
-| Re-entry trigger | Price > 10-day high only | PENDING |
-| No premature entries | 10d high must be new high | PENDING |
-| Days since exit tracked | Counter increments correctly | PENDING |
+### State Files
+- `logs/state.json` — global state (assets, trailPct, startedAt)
+- `logs/assets/BTC-state.json` — BTC-specific state
+- `logs/assets/ETH-state.json` — ETH-specific state
 
 ---
 
-## 6. Weekly Review (every 7 days)
+## 4. Exit Validation (Most Important)
 
-Report:
-- Number of trades (entries + exits)
-- Equity change vs start
-- Realized vs unrealized PnL
-- Deviations from expected behavior
-- Bugs or edge cases observed
+First real exit triggers full audit:
+- [ ] Exit within ±1% of 15% drawdown from peak
+- [ ] No duplicate exit events
+- [ ] No state glitch (position incorrectly set to OUT)
+- [ ] Trail level correctly calculated
+- [ ] Realized PnL correctly logged
+
+### Exit Audit Report Template
+```
+=== EXIT AUDIT ===
+Asset:      BTC
+Date:       2026-04-XX
+Peak:       €XXXXX
+Exit Price: €XXXXX
+Drawdown:   XX.X%
+Expected:   15.0%
+Deviation:  ±X.X%  [PASS/FAIL]
+Position:   OUT   [CORRECT/INCORRECT]
+Trail:      €XXXXX [CLEARED/CORRUPT]
+Events:     [single/duplicate]
+Status:     [VALID/INVALID]
+```
+
+---
+
+## 5. Re-Entry Validation
+
+After first exit, monitor for re-entry:
+- [ ] Re-entry only triggers at true 10-day high
+- [ ] No premature entries
+- [ ] Re-entry price > previous exit price
+- [ ] 10-day high calculation verified against Binance data
+
+### Re-Entry Criteria
+```
+HIGH_10D > previous_peak AND
+HIGH_10D > entry_price * 1.02 (minimum 2% above entry for re-entry)
+```
+
+---
+
+## 6. Weekly Review (after 7 days)
+
+### Report Template
+```
+=== WEEKLY REVIEW #X ===
+Period: YYYY-MM-DD → YYYY-MM-DD
+Duration: X days
+
+TRADES:
+  BTC: X entries, X exits
+  ETH: X entries, X exits
+  Total: X trades
+
+EQUITY:
+  Start: €XXXXX
+  Current: €XXXXX
+  Change: +€XXX (+X.X%)
+  vs B&H: +X.XXpp / -X.XXpp
+
+PERFORMANCE:
+  Win rate: XX%
+  Avg trade: +X.XX%
+  Best trade: +X.XX%
+  Worst trade: -X.XX%
+
+DEVIATIONS:
+  - [list any unexpected behaviors]
+  - [list any bugs/edge cases]
+
+STATUS: [GREEN/YELLOW/RED]
+```
 
 ---
 
 ## 7. Hard Rules
 
-- ❌ NOT optimize parameters
-- ❌ NOT adjust strategy
-- ❌ NOT build new features
-- ✅ ONLY observe, log, validate
-
-**Primary question:** Does realtime behavior match backtester engine?
+- **NO optimizing** — strategy params are locked
+- **NO strategy changes** — RO15 spec is fixed
+- **NO new indicators** — validation, not R&D
+- **Shadow mode only** — no real orders
+- **14-day minimum** — don't draw early conclusions
 
 ---
 
-## Validation Status
+## Status History
 
-| Test | Status | Date |
-|------|--------|------|
-| System startup | ✅ PASS | 2026-04-11 |
-| State restoration | ✅ PASS | 2026-04-11 |
-| Price fetching (BTC+ETH) | ✅ PASS | 2026-04-11 |
-| Trail level calculation | ✅ PASS | 2026-04-11 |
-| First exit event | PENDING | — |
-| First re-entry event | PENDING | — |
-| State integrity restart #1 | PENDING | — |
-| State integrity restart #2 | PENDING | — |
-| Weekly review #1 | PENDING | 2026-04-18 |
-| Weekly review #2 | PENDING | 2026-04-25 |
+| Date       | Day | BTC Pos  | ETH Pos  | Equity   | Status | Notes |
+|------------|-----|----------|----------|----------|--------|-------|
+| 2026-04-11 | 1   | LONG     | LONG     | €20,034  | 🟢 GREEN | Initial state |
