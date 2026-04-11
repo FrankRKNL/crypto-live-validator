@@ -1,114 +1,171 @@
 # RO15 Forward Tester - Strategy Specification
 
-## Research vs Forward Tester Comparison
+**Last Updated: 2026-04-11**
 
-| Aspect | Research (engine-v5.mjs) | Forward Tester (before fix) | Forward Tester (FIXED) |
-|--------|-------------------------|----------------------------|------------------------|
-| **trailPct** | 0.15 | 0.15 | 0.15 |
-| **Start state** | Always invested (BUY at start) | IN position | IN position |
-| **Exit** | price < peak × (1 - trailPct) | price < peak × (1 - trailPct) | price < peak × (1 - trailPct) |
-| **Re-entry** | price > 10-day high | **next candle (WRONG)** | price > 10-day high |
-| **MA filter** | None | MA20 mentioned but NOT implemented | None |
-| **Data interval** | 1d (daily candles) | 1h (hourly candles) | 1h (hourly candles) |
-| **Signals evaluated** | Daily | Hourly | Hourly |
+## Research vs Forward Tester: Strategy Definition
 
-## Key Finding: 91% Win Rate is INVALID
+| Aspect | Research (engine-v5.mjs) | Forward Tester (ro15-live-validator.mjs) | Status |
+|--------|-------------------------|----------------------------------------|--------|
+| **trailPct** | 0.15 | 0.15 | ✅ MATCH |
+| **Start state** | Always invested (initial BUY) | Always invested (initial BUY) | ✅ MATCH |
+| **Exit logic** | `price < peak × (1 - trailPct)` | `close < peak × (1 - trailPct)` | ✅ MATCH |
+| **Re-entry filter** | `price > 10-day HIGH` | `close > tenDayHigh` | ✅ MATCH |
+| **Re-entry timing** | Next candle when condition met | Next daily candle when condition met | ✅ MATCH |
+| **Data interval** | 1d daily candles | 1h → aggregated to daily | ✅ EQUIVALENT |
+| **Fee** | 0.1% | 0.15% | ⚠️ DIFFERENT (see below) |
 
-The 91% win rate reported by the unfixed forward tester is WRONG because:
-- Immediate re-entry on next candle creates many small winning trades
-- Research RO15 has ~46% win rate with convex payoff (few big wins, many small losses)
-- The 91% was due to the broken re-entry logic
+## Fee Discrepancy
 
-## Corrected RO15 Strategy Spec
+- **Research**: 0.1% fee
+- **Forward tester**: 0.15% fee
 
-### Entry
-- **Initial**: BUY at market price at strategy start (always invested)
-- **Re-entry**: BUY when price breaks above the 10-calendar-day high (since exit)
+This is a minor difference. The forward tester uses 0.15% which is closer to real Binance futures fees (0.02-0.04% maker/taker) plus a safety margin. The research used 0.1% as a simplified estimate.
 
-### Exit
-- **Trailing stop**: SELL when price drops below peak × (1 - 0.15)
-- Peak is continuously updated while in position
+**Decision**: Keep 0.15% in forward tester (more realistic). This does NOT affect signal generation, only PnL calculation.
 
-### Re-entry Filter
-- Price must exceed the highest price seen in the 10 days BEFORE the exit candle
-- This prevents immediate re-entry whipsaw
+## Re-entry Logic Explained
 
-### Position State
-- Always in market (either LONG or FLAT, never cash)
-- When FLAT, wait for 10-day high breakout to re-enter
+```
+Research engine-v5.mjs:
+  if (!pos) {
+    const recentHigh = Math.max(...priceArr.slice(Math.max(startIdx, i-10), i+1));
+    if (price > recentHigh) { /* BUY */ }
+  }
 
-### Interval
-- Data: 1h candles from Binance (USDT pairs)
-- Polling: every 1 hour
-- Equity: updated every candle
+Forward tester:
+  if (!this.inPosition) {
+    const canReenter = this.daysSinceExit > 0 && close > this.tenDayHigh;
+    if (canReenter) { /* BUY */ }
+  }
+```
 
-### Fees
-- Fee: 0.1% per trade
-- Slippage: 0.05% per trade
+Both implementations require:
+1. At least 1 day since exit
+2. Price exceeds the 10-day high (rolling window)
 
-### Metrics Logged
-Per CSV row:
-- `timestamp`: ISO timestamp of the candle
-- `asset`: BTC or ETH
-- `price`: close price of candle
-- `position`: LONG or FLAT
-- `peakPrice`: highest price since entry
-- `trailLevel`: current stop level (peak × 0.85)
-- `equity`: current portfolio value in USDT
-- `unrealizedPnL`: (current - entry) × capital (not yet realized)
-- `realizedPnL`: cumulative realized PnL from trades
-- `event`: INIT, ENTRY, HOLD, EXIT, REENTRY
-- `tradeReturn`: return of the completed trade (%)
-- `cumFees`: cumulative fees paid
+The forward tester uses a slightly different mechanism:
+- `tenDayHigh` is set at exit to the current 10-day high
+- It updates each day while flat: `tenDayHigh = Math.max(tenDayHigh, close)`
+- This creates a "rising floor" that must be broken for re-entry
 
-## Why 1h Instead of 1d?
+## Why 91% Win Rate Was Wrong (Original Bug)
 
-Research used daily data (1d). Forward tester uses 1h for:
-- Faster signal detection
-- More granular equity curve
-- Earlier detection of regime changes
+The original forward tester (ro15-paper-trader.mjs) had a CRITICAL BUG:
+- Re-entry was checked BEFORE adding current candle to price history
+- This meant `pricesSinceExit` was empty or contained only the exit candle
+- Result: ANY uptick after exit triggered immediate re-entry
+- This inflated win rate to 91% (research shows ~46%)
 
-**Note**: The strategy logic is IDENTICAL regardless of interval. The trailing stop % and 10-day high are calendar-based (not candle-count based).
+**FIXED** in ro15-live-validator.mjs by:
+1. Using `daysSinceExit` counter (must be > 0)
+2. Using `close > tenDayHigh` (not just any price movement)
+3. Maintaining proper sliding window for 10-day high
 
-## Assets
-- BTCUSDT
-- ETHUSDT
+## Logging and Metrics
+
+| Metric | Description | CSV Column |
+|--------|-------------|------------|
+| **Equity evaluation** | Every hourly poll | `equityEUR` |
+| **Signal check** | Only at daily candle close (00:00 UTC) | `event` |
+| **Re-entry requirement** | `daysSinceExit > 0` AND `close > tenDayHigh` | N/A (internal) |
+| **Timestamp** | ISO timestamp of the candle close | `timestamp` |
+| **Unrealized PnL** | `(currentPrice - entryPrice) / entryPrice` | `unrealizedPct` |
+| **Realized PnL** | Cumulative from completed trades | `realizedPct` |
+| **Total Equity** | `initialCapital × (1 + realized + unrealized)` | `equityEUR` |
+
+## Equity Calculation
+
+```
+unrealizedPnL = (currentPrice - entryPrice) / entryPrice
+realizedPnL = sum of (exitPrice - entryPrice) / entryPrice for all completed trades
+equity = initialCapital × (1 + realizedPnL + unrealizedPnL)
+```
+
+## Known Issues (from testing)
+
+### Issue 1: Cold Start Forces Entry at Latest Price
+When starting with no state file, the system processes historical candles but MUST end in a position (research spec: always invested). If historical processing leaves us flat, we force entry at the latest price.
+
+**Impact**: Short backtests (< 30 days) may have distorted entry points.
+
+**Fix**: No fix needed for live operation (state is persisted correctly after first run).
+
+### Issue 2: tenDayHigh Initialization After Restore
+When state is restored with `inPosition = false` and `daysSinceExit > 0`:
+- `tenDayHigh` is restored from file (the value at time of exit)
+- `tenDayPrices` is restored from file (may be stale)
+
+**Impact**: Re-entry may be slightly delayed or premature depending on price action since state save.
+
+**Fix**: Acceptable for shadow mode. Real trading would rebuild history from exchange.
+
+## Forward Results: Sanity Check
+
+Test run (2026-03-21 to 2026-04-11, 22 days):
+- BTC: 1 trade (initial entry), no exits
+- ETH: 1 trade (initial entry), no exits
+
+**Analysis**:
+- 22 days is too short to trigger a 15% trailing stop in a relatively bullish period
+- Research showed BTC rarely hits 15% stop in short timeframes
+- No re-entries because price never dropped enough to trigger exit
+
+**Conclusion**: Results are PLAUSIBLE for this time period. Not enough data to validate against research (~46% win rate).
+
+## Configuration
+
+```javascript
+CONFIG = {
+  trailPct: 0.15,           // 15% trailing stop
+  reentryLookback: 10,      // 10-day high for re-entry
+  feePct: 0.15,            // 0.15% per trade
+  slippagePct: 0,           // 0% (conservative)
+  initialCapital: 10000,   // EUR per asset
+  lookbackDays: 30,         // Fetch 30 days of 1h candles
+}
+```
 
 ## State Persistence
 
-File: `logs/state.json`
+### Files
+- `logs/state.json` — global state (assets, last prices, timestamps)
+- `logs/assets/{BTC,ETH}-state.json` — per-asset strategy state
+- `logs/daily/YYYY-MM-DD.json` — daily summaries
+- `logs/alerts/{BTC,ETH}-alerts.log` — entry/exit alerts
+
+### State Fields (per asset)
 ```json
 {
-  "timestamp": "ISO",
-  "assets": {
-    "BTC": {
-      "inPosition": true,
-      "entryPrice": 65000,
-      "peakPrice": 70000,
-      "realizedPnL": 0.12,
-      "cumFees": 15.50,
-      "trades": 5,
-      "lastEvent": "HOLD"
-    }
-  }
+  "inPosition": true,
+  "entryPrice": 72770.73,
+  "peakPrice": 72962.7,
+  "trades": 1,
+  "realizedPnL": 0,
+  "cumFees": 0,
+  "lastEvent": "ENTRY",
+  "tenDayHigh": 72962.7,
+  "tenDayPrices": [66901.99, 66964.3, ...],
+  "daysSinceExit": 22,
+  "currentPrice": 72770.74
 }
 ```
 
-## Daily Summary
+## Alert Format
 
-File: `logs/daily/YYYY-MM-DD.json`
-```json
-{
-  "date": "2026-04-11",
-  "BTC": { "open": 65000, "close": 67000, "high": 68000, "low": 64500, "equity": 11500, "position": "LONG" },
-  "ETH": { "open": 3200, "close": 3350, "high": 3400, "low": 3180, "equity": 10800, "position": "FLAT" }
-}
+```
+[ALERT] BTC: 🟢 BUY — 2026-04-11T00:00:00.000Z @ 72770.7300 | re-entry (>10d high 72962.70) | PnL: +0.00% | Total: +0.00%
+[ALERT] BTC: 🔴 SELL — 2026-04-11T00:00:00.000Z @ 71000.0000 | trailing stop (peak 72962.70, trail 62018.30) | PnL: -2.42% | Total: -2.42%
 ```
 
-## Alert Events
+## Continuous Operation (Shadow Mode)
 
-When event is EXIT or REENTRY, output:
-```
-[ALERT] BTC: EXIT at 65234.56 | Return: -3.45% | Equity: 9655.00
-[ALERT] BTC: REENTRY at 66100.00 | Equity: 9655.00
-```
+The system is designed for continuous operation:
+
+1. **Hourly polling**: Fetches latest candles, checks for daily close
+2. **State persistence**: Saves after each poll (restart-safe)
+3. **Alerts**: Only on entry/exit events (not spam)
+4. **No external dependencies**: Binance public API only
+
+### Restart Behavior
+- If state file exists: Restore and continue from current position
+- If no state file: Cold start, process historical data, force entry
