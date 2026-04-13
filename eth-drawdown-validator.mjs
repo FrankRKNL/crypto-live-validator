@@ -119,13 +119,14 @@ async function fetchCandles(symbol, interval = '1h', limit = 500) {
   const r = await fetch(url);
   if (!r.ok) throw new Error(`Binance ${r.status}`);
   const data = await r.json();
-  return data.map(([o, h, l, c, , , , v]) => ({
-    time: new Date(o).getTime(),
-    open: parseFloat(o),
-    high: parseFloat(h),
-    low: parseFloat(l),
-    close: parseFloat(c),
-    volume: parseFloat(v),
+  // Binance kline: [0]opentime,[1]open,[2]high,[3]low,[4]close,[5]volume,[6]closetime,[7]quote
+  return data.map(k => ({
+    time: new Date(k[0]).getTime(),
+    open: parseFloat(k[1]),
+    high: parseFloat(k[2]),
+    low: parseFloat(k[3]),
+    close: parseFloat(k[4]),
+    volume: parseFloat(k[5]),
   }));
 }
 
