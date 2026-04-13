@@ -29,8 +29,8 @@ const POLL_MIN = parseInt(process.argv.find(a => a.startsWith('--interval'))?.sp
 const CONFIG = {
   minDrawdown: 0.03,      // 3% ETH drawdown
   lookbackCandles: 4,     // 4 consecutive candles
-  minATR: 1.0,            // ATR must be > 1.0% (from falsification)
-  maxATR: 2.5,            // ATR cap to avoid overheating
+  minATR: 0.8,           // ATR must be > 0.8% (Frank spec: tussen 0.8% en 2.0%)
+  maxATR: 2.0,            // ATR cap at 2.0%
   btcTrendMax: -0.02,     // BTC must be down >= 2% in last 4h
   holdHours: 2,           // Exit exactly 2h after entry
   feePct: 0.10,           // 10 bps per trade (entry+exit)
