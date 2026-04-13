@@ -193,8 +193,8 @@ function writeCsv(state, reportData) {
   // Trade lines (if any)
   let tradeLines = '';
   if (trades.length > 0) {
-    const todayIso = '2026-04-13'; // current day
-    const todayTrades = trades.filter(t => new Date(t.exitTime).toISOString().slice(0,10) === today);
+    const todayIso = today; // dynamic date
+    const todayTrades = trades.filter(t => new Date(t.exitTime).toISOString().slice(0,10) === todayIso);
     tradeLines = '\n' + todayTrades.map(t => {
       return [
         new Date(t.exitTime).toISOString(),
