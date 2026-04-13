@@ -174,15 +174,19 @@ function writeCsv(state, reportData) {
   
   const header = 'timestamp,asset,position,entryPrice,exitPrice,realizedPct,realizedEUR,durationHours,maxAdverse,maxFavorable,exitReason,signalStrength';
   
-  // Daily summary line (one per day)
+  // One daily summary line per day (overwrite, don't append)
+  const closedTrades = trades.filter(t => t.exitTime);
+  const avgPnl = closedTrades.length > 0 
+    ? (closedTrades.reduce((s, t) => s + t.realizedPnlPct, 0) / closedTrades.length).toFixed(4)
+    : '0';
   const dailyLine = [
     new Date().toISOString(),
     'ETH',
-    trades.length > 0 ? 'CLOSED' : 'FLAT',
+    closedTrades.length > 0 ? 'CLOSED' : 'FLAT',
     '',
     '',
-    trades.length > 0 ? (trades.reduce((s,t) => s + t.realizedPnlPct, 0) / trades.length).toFixed(4) : '0',
-    state.equity - 10000,
+    avgPnl,
+    (state.equity - 10000).toFixed(2),
     reportData?.avgDuration || '',
     state.maxAdverseExcursion || '',
     state.maxFavorableExcursion || '',
@@ -190,10 +194,10 @@ function writeCsv(state, reportData) {
     state.totalSignals || 0
   ].join(',');
 
-  // Trade lines (if any)
+  // Trade lines for today (overwrite)
   let tradeLines = '';
   if (trades.length > 0) {
-    const todayIso = today; // dynamic date
+    const todayIso = today;
     const todayTrades = trades.filter(t => new Date(t.exitTime).toISOString().slice(0,10) === todayIso);
     tradeLines = '\n' + todayTrades.map(t => {
       return [
@@ -214,7 +218,7 @@ function writeCsv(state, reportData) {
   }
 
   const content = header + '\n' + dailyLine + tradeLines + '\n';
-  appendFileSync(csvPath, content);
+  writeFileSync(csvPath, content);  // overwrite (not append)
   console.log(`\n  📄 CSV: ${csvPath}`);
 }
 
